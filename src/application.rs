@@ -22,44 +22,62 @@ use crate::{
 
 use super::packets::RpcPacket;
 
+type SocketAddrSet = Arc<Mutex<HashSet<std::net::SocketAddr>>>;
+type MethodMap = HashMap<u8, MethodInvokeCallback>;
+type EventSubscribers = Arc<Mutex<HashMap<u8, HashSet<std::net::SocketAddr>>>>;
+type EventCallbacks = Arc<Mutex<HashMap<u8, OnEventInvokeCallback>>>;
+type RequestCallbacks = Arc<Mutex<HashMap<u8, MethodResponseCallback>>>;
+
 #[derive(Clone)]
 pub struct RpcApplication {
+    config: RpcConfig,
+    state: RpcState,
+}
+
+#[derive(Clone)]
+pub struct RpcConfig {
     service_id: u16,
     address: std::net::SocketAddr,
-    connected_sockets: Arc<Mutex<HashSet<std::net::SocketAddr>>>,
+}
+
+#[derive(Clone)]
+pub struct RpcState {
+    connected_sockets: SocketAddrSet,
     message_process_tx: tokio::sync::broadcast::Sender<RawMessageData>,
     client_response_tx: tokio::sync::broadcast::Sender<RawMessageData>,
-
-    // Key: Method ID, Value: Callback
-    offered_methods: HashMap<u8, MethodInvokeCallback>,
-
-    // Key: Event ID, Value: Set of subscribers
-    offered_events: Arc<Mutex<HashMap<u8, HashSet<std::net::SocketAddr>>>>,
-    subscribed_events: Arc<Mutex<HashMap<u8, OnEventInvokeCallback>>>,
-
-    // Key: Request ID, Value: Callback
-    open_requests: Arc<Mutex<HashMap<u8, MethodResponseCallback>>>,
+    offered_methods: MethodMap,
+    offered_events: EventSubscribers,
+    subscribed_events: EventCallbacks,
+    open_requests: RequestCallbacks,
 }
 
 impl RpcApplication {
     pub fn new(service_id: u16, address: std::net::SocketAddr) -> Self {
         RpcApplication {
-            service_id,
-            address,
-            connected_sockets: Arc::new(Mutex::new(HashSet::new())),
-            message_process_tx: tokio::sync::broadcast::channel::<RawMessageData>(CHANNEL_CAPACITY)
+            config: RpcConfig {
+                service_id,
+                address,
+            },
+            state: RpcState {
+                connected_sockets: Arc::new(Mutex::new(HashSet::new())),
+                message_process_tx: tokio::sync::broadcast::channel::<RawMessageData>(
+                    CHANNEL_CAPACITY,
+                )
                 .0,
-            client_response_tx: tokio::sync::broadcast::channel::<RawMessageData>(CHANNEL_CAPACITY)
+                client_response_tx: tokio::sync::broadcast::channel::<RawMessageData>(
+                    CHANNEL_CAPACITY,
+                )
                 .0,
-            offered_methods: HashMap::new(),
-            offered_events: Arc::new(Mutex::new(HashMap::new())),
-            subscribed_events: Arc::new(Mutex::new(HashMap::new())),
-            open_requests: Arc::new(Mutex::new(HashMap::new())),
+                offered_methods: HashMap::new(),
+                offered_events: Arc::new(Mutex::new(HashMap::new())),
+                subscribed_events: Arc::new(Mutex::new(HashMap::new())),
+                open_requests: Arc::new(Mutex::new(HashMap::new())),
+            },
         }
     }
 
     async fn handle_message_data(&self) {
-        let mut message_process_rx = self.message_process_tx.subscribe();
+        let mut message_process_rx = self.state.message_process_tx.subscribe();
 
         while let Ok((packet, addr)) = message_process_rx.recv().await {
             trace!("Handling packet: {:?}", packet);
@@ -79,7 +97,7 @@ impl RpcApplication {
                 RpcMessageType::Request => {
                     trace!("Received Request Message: {:?}", packet);
 
-                    if let Some(callback) = self.offered_methods.get(&packet.method_id) {
+                    if let Some(callback) = self.state.offered_methods.get(&packet.method_id) {
                         let result = callback(packet.payload);
                         response_packet = match result {
                             Ok(response_data) => RpcPacket {
@@ -95,7 +113,7 @@ impl RpcApplication {
                     }
 
                     // Handle Event Subscriptions
-                    let mut offered_events = self.offered_events.lock().await;
+                    let mut offered_events = self.state.offered_events.lock().await;
                     if let Some(connected_clients) = offered_events.get_mut(&packet.method_id) {
                         debug!("New event subscription: {:?}", packet.method_id);
 
@@ -103,7 +121,8 @@ impl RpcApplication {
                         connected_clients.insert(addr);
                     }
 
-                    self.client_response_tx
+                    self.state
+                        .client_response_tx
                         .send((response_packet, addr))
                         .unwrap();
                 }
@@ -111,7 +130,7 @@ impl RpcApplication {
                 // If the message is a response, we will check if the request callback is open and call the callback
                 RpcMessageType::Response => {
                     trace!("Received Response Message: {:?}", packet);
-                    let mut open_requests = self.open_requests.lock().await;
+                    let mut open_requests = self.state.open_requests.lock().await;
                     if let Some(callback) = open_requests.remove(&packet.request_id) {
                         if packet.return_code == RpcReturnCode::Ok {
                             let _result = callback(Ok(packet.payload));
@@ -125,7 +144,7 @@ impl RpcApplication {
 
                 RpcMessageType::Notification => {
                     trace!("Received Notification Message: {:?}", packet);
-                    let subscribed_events = self.subscribed_events.lock().await;
+                    let subscribed_events = self.state.subscribed_events.lock().await;
                     if let Some(callback) = subscribed_events.get(&packet.method_id) {
                         callback(packet.payload);
                     }
@@ -133,7 +152,7 @@ impl RpcApplication {
 
                 RpcMessageType::Unsubscribe => {
                     trace!("Received Unsubscribe Message: {:?}", packet);
-                    let mut offered_events = self.offered_events.lock().await;
+                    let mut offered_events = self.state.offered_events.lock().await;
                     if let Some(connected_clients) = offered_events.get_mut(&packet.method_id) {
                         connected_clients.remove(&addr);
                     }
@@ -143,12 +162,13 @@ impl RpcApplication {
     }
 
     pub async fn offer_method(&mut self, method_id: u8, callback: MethodInvokeCallback) {
-        self.offered_methods.insert(method_id, callback);
+        self.state.offered_methods.insert(method_id, callback);
         trace!("Method {} offered", method_id);
     }
 
     pub async fn offer_event(&mut self, event_id: u8) {
-        self.offered_events
+        self.state
+            .offered_events
             .lock()
             .await
             .insert(event_id, HashSet::new());
@@ -158,11 +178,11 @@ impl RpcApplication {
     pub async fn call_event(&self, event_id: u8, payload: Vec<u8>) {
         trace!("Calling event {}", event_id);
         // Send a notification to all clients that have subscribed to the event
-        let offered_events = self.offered_events.lock().await;
+        let offered_events = self.state.offered_events.lock().await;
         if let Some(connected_clients) = offered_events.get(&event_id) {
             for client in connected_clients {
                 let notification_packet = RpcPacket {
-                    service_id: self.service_id as u8,
+                    service_id: self.config.service_id as u8,
                     method_id: event_id,
                     request_id: 0,
                     message_type: RpcMessageType::Notification,
@@ -170,7 +190,8 @@ impl RpcApplication {
                     payload: payload.clone(),
                 };
 
-                self.client_response_tx
+                self.state
+                    .client_response_tx
                     .send((notification_packet, *client))
                     .unwrap();
             }
@@ -179,13 +200,13 @@ impl RpcApplication {
 
     async fn _connect_client(&self, ip_address: std::net::SocketAddr) {
         trace!("Connecting to client: {:?}", ip_address);
-        let mut connected_sockets = self.connected_sockets.lock().await;
+        let mut connected_sockets = self.state.connected_sockets.lock().await;
         if !connected_sockets.contains(&ip_address) {
             let socket = tokio::net::TcpStream::connect(ip_address).await.unwrap();
             connected_sockets.insert(ip_address);
 
             let server = Arc::new(self.clone());
-            let client_response_rx = server.client_response_tx.subscribe();
+            let client_response_rx = server.state.client_response_tx.subscribe();
             tokio::spawn(async move {
                 server.handle_client(socket, client_response_rx).await;
             });
@@ -204,11 +225,11 @@ impl RpcApplication {
         trace!("Calling method {} on {:?}", method_id, ip_address);
         let request_id = self.generate_random_request_id().await;
 
-        let mut open_requests = self.open_requests.lock().await;
+        let mut open_requests = self.state.open_requests.lock().await;
         open_requests.insert(request_id, callback);
 
         let request_packet = RpcPacket {
-            service_id: self.service_id as u8,
+            service_id: self.config.service_id as u8,
             method_id,
             request_id,
             message_type: RpcMessageType::Request,
@@ -216,7 +237,8 @@ impl RpcApplication {
             payload,
         };
 
-        self.client_response_tx
+        self.state
+            .client_response_tx
             .send((request_packet, ip_address))
             .unwrap();
     }
@@ -231,7 +253,7 @@ impl RpcApplication {
         let request_id = self.generate_random_request_id().await;
 
         let request_packet = RpcPacket {
-            service_id: self.service_id as u8,
+            service_id: self.config.service_id as u8,
             method_id: event_id,
             request_id,
             message_type: RpcMessageType::Request,
@@ -239,11 +261,12 @@ impl RpcApplication {
             payload: vec![],
         };
 
-        self.client_response_tx
+        self.state
+            .client_response_tx
             .send((request_packet, ip_address))
             .unwrap();
 
-        let mut subscribed_events = self.subscribed_events.lock().await;
+        let mut subscribed_events = self.state.subscribed_events.lock().await;
         subscribed_events.insert(event_id, callback);
     }
 
@@ -252,7 +275,7 @@ impl RpcApplication {
         let request_id = self.generate_random_request_id().await;
 
         let request_packet = RpcPacket {
-            service_id: self.service_id as u8,
+            service_id: self.config.service_id as u8,
             method_id: event_id,
             request_id,
             message_type: RpcMessageType::Unsubscribe,
@@ -260,11 +283,12 @@ impl RpcApplication {
             payload: vec![],
         };
 
-        self.client_response_tx
+        self.state
+            .client_response_tx
             .send((request_packet, ip_address))
             .unwrap();
 
-        let mut subscribed_events = self.subscribed_events.lock().await;
+        let mut subscribed_events = self.state.subscribed_events.lock().await;
         subscribed_events.remove(&event_id);
     }
 
@@ -281,7 +305,7 @@ impl RpcApplication {
     ) {
         info!("Waiting for {:?} to be available ...", ip_address);
 
-        let mut connected_sockets = self.connected_sockets.lock().await;
+        let mut connected_sockets = self.state.connected_sockets.lock().await;
         if !connected_sockets.contains(&ip_address) {
             let mut attempts = 0;
             let socket = loop {
@@ -308,7 +332,7 @@ impl RpcApplication {
             connected_sockets.insert(ip_address);
 
             let server = Arc::new(self.clone());
-            let client_response_rx = server.client_response_tx.subscribe();
+            let client_response_rx = server.state.client_response_tx.subscribe();
             tokio::spawn(async move {
                 server.handle_client(socket, client_response_rx).await;
             });
@@ -324,7 +348,7 @@ impl RpcApplication {
         let ip_addr = socket.peer_addr().unwrap();
 
         {
-            let mut connected_sockets = self.connected_sockets.lock().await;
+            let mut connected_sockets = self.state.connected_sockets.lock().await;
             connected_sockets.insert(ip_addr);
         }
 
@@ -338,10 +362,10 @@ impl RpcApplication {
                     if result.unwrap() == 0 {
                         info!("[Disconnected] {:?}", ip_addr);
                         {
-                            let mut connected_sockets = self.connected_sockets.lock().await;
+                            let mut connected_sockets = self.state.connected_sockets.lock().await;
                             connected_sockets.remove(&ip_addr);
 
-                            let mut offered_events = self.offered_events.lock().await;
+                            let mut offered_events = self.state.offered_events.lock().await;
                             for (_, connected_clients) in offered_events.iter_mut() {
                                 connected_clients.remove(&ip_addr);
                             }
@@ -351,7 +375,7 @@ impl RpcApplication {
 
                     match RpcPacket::from_bytes(buffer.clone()) {
                         Ok(packet) => {
-                            self.message_process_tx.send((packet, ip_addr)).unwrap();
+                            self.state.message_process_tx.send((packet, ip_addr)).unwrap();
                         },
                         Err(err) => {
                             error!("Error deserializing packet: {:?}", err);
@@ -383,12 +407,12 @@ impl RpcApplication {
     }
 
     pub async fn run(&self, blocking: bool) {
-        let listener = TcpListener::bind(self.address).await.unwrap();
+        let listener = TcpListener::bind(self.config.address).await.unwrap();
 
         info!(
             "RPC Application started on {:?}:{:?}",
-            self.address.ip(),
-            self.address.port()
+            self.config.address.ip(),
+            self.config.address.port()
         );
 
         let server = Arc::new(self.clone());
@@ -401,7 +425,7 @@ impl RpcApplication {
                 let (socket, _addr) = listener.accept().await.unwrap();
                 info!("[Connected] {:?}", _addr);
 
-                let client_response_rx = self.client_response_tx.subscribe();
+                let client_response_rx = self.state.client_response_tx.subscribe();
 
                 let server = Arc::new(self.clone());
                 tokio::spawn(async move {
@@ -416,7 +440,7 @@ impl RpcApplication {
                     info!("[Connected] {:?}", _addr);
 
                     let server = Arc::new(server.clone());
-                    let client_response_rx = server.client_response_tx.subscribe();
+                    let client_response_rx = server.state.client_response_tx.subscribe();
                     tokio::spawn(async move {
                         server.handle_client(socket, client_response_rx).await;
                     });
