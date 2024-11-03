@@ -49,23 +49,11 @@ impl RpcPacket {
         }
     }
 
-    pub fn from_bytes(bytes: Vec<u8>) -> Result<RpcPacket, Vec<u8>> {
-        match rmp_serde::from_slice::<RpcPacket>(&bytes) {
-            Ok(packet) => Ok(packet),
-            Err(err) => {
-                println!("Error deserializing packet: {:?}", err);
-                Err("Error deserializing packet".as_bytes().to_vec())
-            }
-        }
+    pub fn from_bytes(bytes: Vec<u8>) -> Result<RpcPacket, rmp_serde::decode::Error> {
+        rmp_serde::from_slice::<RpcPacket>(&bytes)
     }
 
-    pub fn to_bytes(packet: &RpcPacket) -> Result<Vec<u8>, Vec<u8>> {
-        match rmp_serde::to_vec(packet) {
-            Ok(bytes) => Ok(bytes),
-            Err(err) => {
-                println!("Error serializing packet: {:?}", err);
-                Err("Error serializing packet".as_bytes().to_vec())
-            }
-        }
+    pub fn to_bytes(packet: &RpcPacket) -> Result<Vec<u8>, rmp_serde::encode::Error> {
+        rmp_serde::to_vec(packet)
     }
 }

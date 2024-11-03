@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
-use simplerpcrs::{application::RpcApplication, packets::RpcErrorMessage};
+use simplerpcrs::{
+    application::{events::RpcEvents, methods::RpcMethods, RpcApplication},
+    packets::RpcErrorMessage,
+};
 
 const RPC_ID: u16 = 0x01;
 
@@ -33,7 +36,13 @@ async fn main() -> Result<(), anyhow::Error> {
     )
     .await;
 
-    app.run(true).await;
+    app.offer_event(0x02).await;
 
-    Ok(())
+    app.run(false).await;
+
+    loop {
+        let position = rand::random::<u8>();
+        app.call_event(0x02, vec![position]).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    }
 }

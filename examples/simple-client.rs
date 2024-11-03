@@ -1,6 +1,7 @@
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
-use simplerpcrs::application::RpcApplication;
+use log::info;
+use simplerpcrs::application::{events::RpcEvents, methods::RpcMethods, RpcApplication};
 
 const RPC_ID: u16 = 0x02;
 
@@ -22,6 +23,7 @@ async fn main() -> Result<(), anyhow::Error> {
     app.wait_for_availability(server_address, 5, Duration::from_secs(5))
         .await;
 
+    info!("Calling method 0x01");
     app.call_method(
         server_address,
         0x01,
@@ -37,6 +39,16 @@ async fn main() -> Result<(), anyhow::Error> {
             }
 
             Ok(vec![])
+        }),
+    )
+    .await;
+
+    info!("Subscribing to event 0x02");
+    app.subscribe_event(
+        server_address,
+        0x02,
+        Arc::new(|data| {
+            log::info!("Received event data: {:?}", data);
         }),
     )
     .await;
