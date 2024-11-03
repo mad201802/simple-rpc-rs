@@ -6,10 +6,9 @@ pub enum RpcMessageType {
     Notification = 0x02,
     Unsubscribe = 0x03,
     Response = 0x80,
-    Error = 0x81,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum RpcReturnCode {
     Ok = 0x00,
     Error = 0x01,
@@ -23,6 +22,12 @@ pub struct RpcPacket {
     pub message_type: RpcMessageType, // Defines the type of message
     pub return_code: RpcReturnCode,   // Defines the return code
     pub payload: Vec<u8>,             // Contains the actual data
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RpcErrorMessage {
+    pub error_code: u8,
+    pub error_message: String,
 }
 
 impl RpcPacket {
